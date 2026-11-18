@@ -35,7 +35,7 @@ function Write-Step([int]$Number, [string]$Text) {
     Write-Host "[$Number/$TotalSteps] $Text" -ForegroundColor Yellow
 }
 
-function Write-Ok([string]$Text)   { Write-Host "    OK    $Text" -ForegroundColor Green }
+function Write-Ok([string]$Text)      { Write-Host "    OK    $Text" -ForegroundColor Green }
 function Write-ErrLine([string]$Text) { Write-Host "    ERROR $Text" -ForegroundColor Red }
 
 function Exit-WithError([string]$Message) {
@@ -45,40 +45,65 @@ function Exit-WithError([string]$Message) {
     exit 1
 }
 
-function Invoke-WithRetry {
+# Runs a scriptblock in a background job while animating a spinner on the
+# current line, so the terminal never sits blank during a network call.
+function Invoke-WithSpinner {
     param(
-        [Parameter(Mandatory)][scriptblock]$Action,
-        [int]$MaxAttempts = 3,
-        [int]$DelaySeconds = 2
+        [Parameter(Mandatory)] [string]        $Message,
+        [Parameter(Mandatory)] [scriptblock]   $ScriptBlock,
+        [object[]] $ArgumentList = @()
     )
-    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-        try {
-            return & $Action
-        } catch {
-            if ($attempt -eq $MaxAttempts) { throw }
-            Write-Host "    retrying ($attempt/$MaxAttempts)..." -ForegroundColor DarkYellow
-            Start-Sleep -Seconds $DelaySeconds
-        }
-    }
-}
 
-function Get-WebTextUtf8([string]$Uri) {
-    $res = Invoke-WebRequest -Uri $Uri -UseBasicParsing -Headers @{ "User-Agent" = "QueLes-Installer" }
-    $bytes = $res.Content
-    if ($bytes -is [byte[]]) {
-        return [System.Text.Encoding]::UTF8.GetString($bytes).Trim().TrimStart([char]0xFEFF)
+    $job      = Start-Job -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList
+    $spinner  = @('|', '/', '-', '\')
+    $idx      = 0
+    $padWidth = $Message.Length + 10
+
+    try {
+        while ($job.State -eq 'Running') {
+            Write-Host -NoNewline ("`r    {0} {1}" -f $spinner[$idx % $spinner.Length], $Message)
+            Start-Sleep -Milliseconds 110
+            $idx++
+        }
+        $output = Receive-Job -Job $job -ErrorAction Stop
+    } catch {
+        Write-Host ("`r    ERROR {0}" -f $Message).PadRight($padWidth)
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        throw
     }
-    return $res.Content.Trim().TrimStart([char]0xFEFF)
+
+    Write-Host ("`r    OK    {0}" -f $Message).PadRight($padWidth)
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    return $output
 }
 
 function Invoke-FileDownload([string]$Url, [string]$OutFile) {
     if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
         & curl.exe -f -L --progress-bar -o "$OutFile" "$Url"
-        if ($LASTEXITCODE -ne 0) {
-            throw "curl exited with code $LASTEXITCODE"
-        }
+        if ($LASTEXITCODE -ne 0) { throw "curl exited with code $LASTEXITCODE" }
     } else {
         Invoke-WebRequest -Uri "$Url" -OutFile $OutFile -UseBasicParsing
+    }
+}
+
+# Scriptblock run inside the spinner job - needs its own TLS setup since it
+# executes in a separate process with no access to the outer session.
+$FetchTextJob = {
+    param($Uri)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+    $attempts = 3
+    for ($i = 1; $i -le $attempts; $i++) {
+        try {
+            $res   = Invoke-WebRequest -Uri $Uri -UseBasicParsing -Headers @{ "User-Agent" = "QueLes-Installer" }
+            $bytes = $res.Content
+            if ($bytes -is [byte[]]) {
+                return [System.Text.Encoding]::UTF8.GetString($bytes).Trim().TrimStart([char]0xFEFF)
+            }
+            return $res.Content.Trim().TrimStart([char]0xFEFF)
+        } catch {
+            if ($i -eq $attempts) { throw }
+            Start-Sleep -Seconds 2
+        }
     }
 }
 
@@ -96,7 +121,8 @@ try {
     # 1. Manifest
     Write-Step 1 "Fetching latest release manifest"
     try {
-        $manifestJson = Invoke-WithRetry { Get-WebTextUtf8 -Uri "https://github.com/$RepoOwner/$RepoName/releases/latest/download/latest.json" }
+        $manifestJson = Invoke-WithSpinner -Message "Contacting GitHub" -ScriptBlock $FetchTextJob `
+            -ArgumentList "https://github.com/$RepoOwner/$RepoName/releases/latest/download/latest.json"
         $manifest    = $manifestJson | ConvertFrom-Json
         $version     = $manifest.version
         $downloadUrl = $manifest.platforms.'windows-x86_64'.url
@@ -104,14 +130,15 @@ try {
     } catch {
         Exit-WithError "Could not retrieve release manifest. $_"
     }
-    Write-Ok "Target version v$version"
+    Write-Host "    Target version: v$version" -ForegroundColor Green
 
     # 2. Checksums
     Write-Step 2 "Fetching release checksums"
     $fileName = Split-Path -Leaf $downloadUrl
     $expectedHash = $null
     try {
-        $checksumsText = Invoke-WithRetry { Get-WebTextUtf8 -Uri "https://github.com/$RepoOwner/$RepoName/releases/download/v$version/SHA256SUMS.txt" }
+        $checksumsText = Invoke-WithSpinner -Message "Verifying release index" -ScriptBlock $FetchTextJob `
+            -ArgumentList "https://github.com/$RepoOwner/$RepoName/releases/download/v$version/SHA256SUMS.txt"
         foreach ($line in ($checksumsText -split "`r?`n")) {
             if ($line -match "^([A-Fa-f0-9]{64})\s+\*?(.+)$" -and $Matches[2].Trim() -eq $fileName) {
                 $expectedHash = $Matches[1].ToUpper()
@@ -124,14 +151,13 @@ try {
     if (-not $expectedHash) {
         Exit-WithError "No checksum entry found for '$fileName'."
     }
-    Write-Ok "Checksum entry located"
 
-    # 3. Download
+    # 3. Download (curl's own progress bar gives live feedback here)
     Write-Step 3 "Downloading $fileName"
     $installerPath = Join-Path ([System.IO.Path]::GetTempPath()) $fileName
     Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
     try {
-        Invoke-WithRetry { Invoke-FileDownload -Url $downloadUrl -OutFile $installerPath }
+        Invoke-FileDownload -Url $downloadUrl -OutFile $installerPath
     } catch {
         Exit-WithError "Download failed. $_"
     }
@@ -152,7 +178,6 @@ try {
     }
     Write-Ok "SHA256 verified"
 
-    # Only now is it safe to drop the download-source marker
     Unblock-File -Path $installerPath -ErrorAction SilentlyContinue
 
     # 5. Install
